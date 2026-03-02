@@ -26,6 +26,7 @@ Click the menu bar icon to adjust:
 - Speed (WPM presets)
 - Typo profile
 - Word pause profile
+- Toggle caret-following progress overlay
 
 ## Install From Source
 

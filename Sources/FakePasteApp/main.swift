@@ -11,13 +11,15 @@ struct AppTypingSettings {
     var wordPauseChance: Double
     var wordPauseMin: Double
     var wordPauseMax: Double
+    var showProgressOverlay: Bool
 
     static let `default` = AppTypingSettings(
         wpm: 130.0,
         typoRate: 0.04,
         wordPauseChance: 0.18,
         wordPauseMin: 0.08,
-        wordPauseMax: 0.22
+        wordPauseMax: 0.22,
+        showProgressOverlay: false
     )
 
     func makeModel() -> HumanTypingModel {
@@ -43,7 +45,8 @@ struct AppTypingSettings {
             typoRate: defaults.object(forKey: "settings.typoRate") as? Double ?? AppTypingSettings.default.typoRate,
             wordPauseChance: defaults.object(forKey: "settings.wordPauseChance") as? Double ?? AppTypingSettings.default.wordPauseChance,
             wordPauseMin: defaults.object(forKey: "settings.wordPauseMin") as? Double ?? AppTypingSettings.default.wordPauseMin,
-            wordPauseMax: defaults.object(forKey: "settings.wordPauseMax") as? Double ?? AppTypingSettings.default.wordPauseMax
+            wordPauseMax: defaults.object(forKey: "settings.wordPauseMax") as? Double ?? AppTypingSettings.default.wordPauseMax,
+            showProgressOverlay: defaults.object(forKey: "settings.showProgressOverlay") as? Bool ?? AppTypingSettings.default.showProgressOverlay
         )
     }
 
@@ -54,6 +57,190 @@ struct AppTypingSettings {
         defaults.set(wordPauseChance, forKey: "settings.wordPauseChance")
         defaults.set(wordPauseMin, forKey: "settings.wordPauseMin")
         defaults.set(wordPauseMax, forKey: "settings.wordPauseMax")
+        defaults.set(showProgressOverlay, forKey: "settings.showProgressOverlay")
+    }
+}
+
+final class ProgressOverlayController {
+    private let panel: NSPanel
+    private let progressTrack: NSView
+    private let progressFill: NSView
+    private var progressFillWidthConstraint: NSLayoutConstraint?
+    private var followTimer: Timer?
+
+    init() {
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 180, height: 24),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.level = .floating
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.hidesOnDeactivate = false
+        panel.ignoresMouseEvents = true
+
+        progressTrack = NSView(frame: NSRect(x: 12, y: 8, width: 156, height: 8))
+        progressTrack.wantsLayer = true
+        progressTrack.layer?.backgroundColor = NSColor(calibratedWhite: 0.35, alpha: 1.0).cgColor
+        progressTrack.layer?.cornerRadius = 4
+
+        progressFill = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 8))
+        progressFill.wantsLayer = true
+        progressFill.layer?.backgroundColor = NSColor(calibratedRed: 0.52, green: 0.46, blue: 0.70, alpha: 1.0).cgColor
+        progressFill.layer?.cornerRadius = 4
+
+        let contentView = NSView(frame: panel.contentRect(forFrameRect: panel.frame))
+        contentView.wantsLayer = true
+        contentView.layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
+        contentView.layer?.cornerRadius = 10
+        contentView.layer?.cornerCurve = .continuous
+        contentView.layer?.masksToBounds = true
+        progressTrack.translatesAutoresizingMaskIntoConstraints = false
+        progressFill.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(progressTrack)
+        progressTrack.addSubview(progressFill)
+        NSLayoutConstraint.activate([
+            progressTrack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            progressTrack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+            progressTrack.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            progressTrack.heightAnchor.constraint(equalToConstant: 8),
+            progressFill.leadingAnchor.constraint(equalTo: progressTrack.leadingAnchor),
+            progressFill.topAnchor.constraint(equalTo: progressTrack.topAnchor),
+            progressFill.bottomAnchor.constraint(equalTo: progressTrack.bottomAnchor),
+        ])
+        progressFillWidthConstraint = progressFill.widthAnchor.constraint(equalToConstant: 0)
+        progressFillWidthConstraint?.isActive = true
+        panel.contentView = contentView
+    }
+
+    func show() {
+        setProgress(0)
+        repositionNearCaret()
+        panel.orderFrontRegardless()
+        startFollowingCaret()
+    }
+
+    func hide() {
+        stopFollowingCaret()
+        panel.orderOut(nil)
+    }
+
+    func setProgress(_ value: Double) {
+        let clamped = min(1.0, max(0.0, value))
+        let maxWidth: CGFloat = 156
+        progressFillWidthConstraint?.constant = maxWidth * clamped
+        panel.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    private func startFollowingCaret() {
+        stopFollowingCaret()
+        followTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] _ in
+            self?.repositionNearCaret()
+        }
+    }
+
+    private func stopFollowingCaret() {
+        followTimer?.invalidate()
+        followTimer = nil
+    }
+
+    private func repositionNearCaret() {
+        let panelSize = panel.frame.size
+        if let caret = currentCaretRect(), !isLikelyInvalidCaret(caret) {
+            let direct = clamped(point: NSPoint(x: caret.midX - (panelSize.width / 2.0), y: caret.maxY + 14), panelSize: panelSize)
+            let flipped = clamped(point: flippedCaretOrigin(caret, panelSize: panelSize), panelSize: panelSize)
+            panel.setFrameOrigin(bestCandidate([direct, flipped], panelSize: panelSize))
+            return
+        }
+
+        panel.setFrameOrigin(clamped(point: topCenterFallbackOrigin(panelSize: panelSize), panelSize: panelSize))
+    }
+
+    private func flippedCaretOrigin(_ caret: CGRect, panelSize: NSSize) -> NSPoint {
+        guard let screen = bestScreen(forX: caret.midX) else {
+            return NSPoint(x: caret.midX - (panelSize.width / 2.0), y: caret.maxY + 14)
+        }
+
+        let cocoaCaretY = screen.frame.maxY - caret.origin.y - caret.height
+        return NSPoint(x: caret.midX - (panelSize.width / 2.0), y: cocoaCaretY + caret.height + 14)
+    }
+
+    private func isPointOnAnyScreen(_ point: NSPoint) -> Bool {
+        NSScreen.screens.contains { $0.frame.contains(point) }
+    }
+
+    private func bestCandidate(_ candidates: [NSPoint], panelSize: NSSize) -> NSPoint {
+        let mouse = NSEvent.mouseLocation
+        let scored = candidates.map { point -> (NSPoint, CGFloat) in
+            let center = NSPoint(x: point.x + panelSize.width / 2.0, y: point.y + panelSize.height / 2.0)
+            let distance = hypot(center.x - mouse.x, center.y - mouse.y)
+            return (point, distance)
+        }
+        return scored.min(by: { $0.1 < $1.1 })?.0 ?? candidates.first ?? NSPoint(x: 0, y: 0)
+    }
+
+    private func isLikelyInvalidCaret(_ caret: CGRect) -> Bool {
+        if caret.isNull || caret.isInfinite || caret.isEmpty {
+            return true
+        }
+        return abs(caret.origin.x) < 0.5 && abs(caret.origin.y) < 0.5 && caret.width < 1.5 && caret.height < 1.5
+    }
+
+    private func bestScreen(forX x: CGFloat) -> NSScreen? {
+        NSScreen.screens.first(where: { $0.frame.minX <= x && x <= $0.frame.maxX }) ?? NSScreen.main
+    }
+
+    private func clamped(point: NSPoint, panelSize: NSSize) -> NSPoint {
+        guard let screen = bestScreen(forX: point.x + panelSize.width / 2.0) else { return point }
+        let visible = screen.visibleFrame.insetBy(dx: 4, dy: 4)
+        let clampedX = min(max(point.x, visible.minX), visible.maxX - panelSize.width)
+        let clampedY = min(max(point.y, visible.minY), visible.maxY - panelSize.height)
+        return NSPoint(x: clampedX, y: clampedY)
+    }
+
+    private func topCenterFallbackOrigin(panelSize: NSSize) -> NSPoint {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            return NSPoint(x: 0, y: 0)
+        }
+
+        let visible = screen.visibleFrame
+        let x = visible.midX - (panelSize.width / 2.0)
+        let y = visible.maxY - panelSize.height - 6
+        return NSPoint(x: x, y: y)
+    }
+
+    private func currentCaretRect() -> CGRect? {
+        let system = AXUIElementCreateSystemWide()
+
+        var focusedObject: AnyObject?
+        let focusedStatus = AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedObject)
+        guard focusedStatus == .success, let focused = focusedObject else { return nil }
+
+        let element = focused as! AXUIElement
+        var selectedRangeObject: AnyObject?
+        let rangeStatus = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selectedRangeObject)
+        guard rangeStatus == .success, let selectedRangeObject else { return nil }
+        guard CFGetTypeID(selectedRangeObject) == AXValueGetTypeID() else { return nil }
+        let selectedRangeValue = unsafeBitCast(selectedRangeObject, to: AXValue.self)
+
+        var boundsObject: AnyObject?
+        let boundsStatus = AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            selectedRangeValue,
+            &boundsObject
+        )
+        guard boundsStatus == .success, let boundsObject else { return nil }
+        guard CFGetTypeID(boundsObject) == AXValueGetTypeID() else { return nil }
+        let boundsValue = unsafeBitCast(boundsObject, to: AXValue.self)
+
+        var rect = CGRect.zero
+        guard AXValueGetType(boundsValue) == .cgRect, AXValueGetValue(boundsValue, .cgRect, &rect) else { return nil }
+        return rect
     }
 }
 
@@ -70,6 +257,7 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
     private var shouldCancelTyping = false
     private var lastHotkeyHandledAt: CFAbsoluteTime = 0
     private var settings = AppTypingSettings.load()
+    private let progressOverlay = ProgressOverlayController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -110,6 +298,16 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeSpeedMenu())
         menu.addItem(makeTyposMenu())
         menu.addItem(makePausesMenu())
+
+        let progressOverlayItem = NSMenuItem(
+            title: "Show Progress Overlay",
+            action: #selector(toggleProgressOverlay),
+            keyEquivalent: ""
+        )
+        progressOverlayItem.target = self
+        progressOverlayItem.state = settings.showProgressOverlay ? .on : .off
+        menu.addItem(progressOverlayItem)
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"))
 
@@ -216,6 +414,26 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
         refreshMenu()
     }
 
+    @objc private func toggleProgressOverlay() {
+        lock.lock()
+        settings.showProgressOverlay.toggle()
+        settings.save()
+        let shouldShow = settings.showProgressOverlay && isTyping
+        lock.unlock()
+
+        if shouldShow {
+            DispatchQueue.main.async { [weak self] in
+                self?.progressOverlay.show()
+            }
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.progressOverlay.hide()
+            }
+        }
+
+        refreshMenu()
+    }
+
     private func setupHotkeyMonitors() {
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyUp) { [weak self] event in
             self?.handleKeyEvent(event)
@@ -278,12 +496,21 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
         let currentSettings = settings
         lock.unlock()
 
+        if currentSettings.showProgressOverlay {
+            DispatchQueue.main.async { [weak self] in
+                self?.progressOverlay.show()
+            }
+        }
+
         typingQueue.async { [weak self] in
             defer {
                 self?.lock.lock()
                 self?.isTyping = false
                 self?.shouldCancelTyping = false
                 self?.lock.unlock()
+                DispatchQueue.main.async { [weak self] in
+                    self?.progressOverlay.hide()
+                }
             }
 
             guard let self else { return }
@@ -298,6 +525,9 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
     private func execute(_ actions: [TypingAction]) {
         guard let source = CGEventSource(stateID: .hidSystemState) else { return }
 
+        let totalActions = max(1, actions.count)
+        var completed = 0
+
         for action in actions {
             if isTypingCancelled() {
                 return
@@ -310,6 +540,12 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
                 sendBackspace(source: source)
             case .delay(let delay):
                 sleepInterruptible(delay)
+            }
+
+            completed += 1
+            let progress = Double(completed) / Double(totalActions)
+            DispatchQueue.main.async { [weak self] in
+                self?.progressOverlay.setProgress(progress)
             }
         }
     }
