@@ -65,12 +65,13 @@ final class ProgressOverlayController {
     private let panel: NSPanel
     private let progressTrack: NSView
     private let progressFill: NSView
+    private let remainingTimeLabel: NSTextField
     private var progressFillWidthConstraint: NSLayoutConstraint?
     private var followTimer: Timer?
 
     init() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 180, height: 24),
+            contentRect: NSRect(x: 0, y: 0, width: 194, height: 24),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -93,6 +94,13 @@ final class ProgressOverlayController {
         progressFill.layer?.backgroundColor = NSColor(calibratedRed: 0.52, green: 0.46, blue: 0.70, alpha: 1.0).cgColor
         progressFill.layer?.cornerRadius = 4
 
+        remainingTimeLabel = NSTextField(labelWithString: "")
+        remainingTimeLabel.textColor = NSColor(calibratedWhite: 0.86, alpha: 1.0)
+        remainingTimeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        remainingTimeLabel.alignment = .right
+        remainingTimeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        remainingTimeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         let contentView = NSView(frame: panel.contentRect(forFrameRect: panel.frame))
         contentView.wantsLayer = true
         contentView.layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
@@ -101,13 +109,17 @@ final class ProgressOverlayController {
         contentView.layer?.masksToBounds = true
         progressTrack.translatesAutoresizingMaskIntoConstraints = false
         progressFill.translatesAutoresizingMaskIntoConstraints = false
+        remainingTimeLabel.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(progressTrack)
+        contentView.addSubview(remainingTimeLabel)
         progressTrack.addSubview(progressFill)
         NSLayoutConstraint.activate([
-            progressTrack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
-            progressTrack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+            progressTrack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 8),
+            progressTrack.trailingAnchor.constraint(equalTo: remainingTimeLabel.leadingAnchor, constant: -2),
             progressTrack.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
             progressTrack.heightAnchor.constraint(equalToConstant: 8),
+            remainingTimeLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -6),
+            remainingTimeLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
             progressFill.leadingAnchor.constraint(equalTo: progressTrack.leadingAnchor),
             progressFill.topAnchor.constraint(equalTo: progressTrack.topAnchor),
             progressFill.bottomAnchor.constraint(equalTo: progressTrack.bottomAnchor),
@@ -118,7 +130,7 @@ final class ProgressOverlayController {
     }
 
     func show() {
-        setProgress(0)
+        setProgress(0, remainingTime: nil)
         repositionNearCaret()
         panel.orderFrontRegardless()
         startFollowingCaret()
@@ -129,11 +141,24 @@ final class ProgressOverlayController {
         panel.orderOut(nil)
     }
 
-    func setProgress(_ value: Double) {
+    func setProgress(_ value: Double, remainingTime: TimeInterval? = nil) {
         let clamped = min(1.0, max(0.0, value))
-        let maxWidth: CGFloat = 156
-        progressFillWidthConstraint?.constant = maxWidth * clamped
         panel.contentView?.layoutSubtreeIfNeeded()
+        let maxWidth = progressTrack.bounds.width
+        progressFillWidthConstraint?.constant = maxWidth * clamped
+        remainingTimeLabel.stringValue = formatRemainingTime(remainingTime)
+        panel.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    private func formatRemainingTime(_ remainingTime: TimeInterval?) -> String {
+        guard let remainingTime else { return "" }
+        let clampedSeconds = max(0, Int(ceil(remainingTime)))
+        if clampedSeconds < 60 {
+            return "\(clampedSeconds)s"
+        }
+        let minutes = clampedSeconds / 60
+        let seconds = clampedSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
     }
 
     private func startFollowingCaret() {
@@ -526,7 +551,18 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
         guard let source = CGEventSource(stateID: .hidSystemState) else { return }
 
         let totalActions = max(1, actions.count)
+        let estimatedTotalDuration = max(0, actions.reduce(0.0) { partial, action in
+            if case let .delay(delay) = action {
+                return partial + delay
+            }
+            return partial
+        })
+        let startTime = CFAbsoluteTimeGetCurrent()
         var completed = 0
+
+        DispatchQueue.main.async { [weak self] in
+            self?.progressOverlay.setProgress(0, remainingTime: estimatedTotalDuration)
+        }
 
         for action in actions {
             if isTypingCancelled() {
@@ -544,8 +580,12 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
 
             completed += 1
             let progress = Double(completed) / Double(totalActions)
+            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+            let modelRemaining = max(0, estimatedTotalDuration - elapsed)
+            let paceRemaining = max(0, (elapsed / max(progress, 0.001)) - elapsed)
+            let remainingTime = progress < 0.15 ? modelRemaining : paceRemaining
             DispatchQueue.main.async { [weak self] in
-                self?.progressOverlay.setProgress(progress)
+                self?.progressOverlay.setProgress(progress, remainingTime: remainingTime)
             }
         }
     }
