@@ -1,7 +1,9 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import FakePasteCore
 import Foundation
+import SwiftPermiso
 
 struct AppTypingSettings {
     static let wpmNormalizationFactor: Double = 9.0
@@ -273,6 +275,8 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var globalMonitor: Any?
     private var localMonitor: Any?
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyEventHandler: EventHandlerRef?
 
     private let hotkeyQueue = DispatchQueue(label: "com.fakepaste.hotkey", qos: .userInitiated)
     private let typingQueue = DispatchQueue(label: "com.fakepaste.typing", qos: .userInitiated)
@@ -283,15 +287,22 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
     private var lastHotkeyHandledAt: CFAbsoluteTime = 0
     private var settings = AppTypingSettings.load()
     private let progressOverlay = ProgressOverlayController()
+    private var permissionWatchTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        requestAccessibilityPermissionPrompt()
         setupStatusItem()
         setupHotkeyMonitors()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        permissionWatchTimer?.invalidate()
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+        }
+        if let hotKeyEventHandler {
+            RemoveEventHandler(hotKeyEventHandler)
+        }
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
     }
@@ -323,6 +334,14 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeSpeedMenu())
         menu.addItem(makeTyposMenu())
         menu.addItem(makePausesMenu())
+
+        let permissionsItem = NSMenuItem(
+            title: "Open Permission Helper",
+            action: #selector(openPermissionHelper),
+            keyEquivalent: ""
+        )
+        permissionsItem.target = self
+        menu.addItem(permissionsItem)
 
         let progressOverlayItem = NSMenuItem(
             title: "Show Progress Overlay",
@@ -460,6 +479,8 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupHotkeyMonitors() {
+        setupRegisteredHotkey()
+
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyUp) { [weak self] event in
             self?.handleKeyEvent(event)
         }
@@ -468,6 +489,58 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
             self?.handleKeyEvent(event)
             return event
         }
+    }
+
+    private func setupRegisteredHotkey() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
+        let selfPointer = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        let installStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, userData in
+                guard let userData else { return noErr }
+                let app = Unmanaged<FakePasteAppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                app.handleRegisteredHotkey(event)
+                return noErr
+            },
+            1,
+            &eventType,
+            selfPointer,
+            &hotKeyEventHandler
+        )
+        guard installStatus == noErr else {
+            print("FakePaste: failed to install hotkey handler (\(installStatus))")
+            return
+        }
+
+        let hotKeyID = EventHotKeyID(signature: fourCharCode("FPst"), id: 1)
+        let registerStatus = RegisterEventHotKey(
+            UInt32(kVK_ANSI_V),
+            UInt32(cmdKey | optionKey),
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+        if registerStatus != noErr {
+            print("FakePaste: failed to register Option+Cmd+V (\(registerStatus))")
+        }
+    }
+
+    private func handleRegisteredHotkey(_ event: EventRef?) {
+        guard let event else { return }
+        var hotKeyID = EventHotKeyID()
+        let status = GetEventParameter(
+            event,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+        guard status == noErr, hotKeyID.signature == fourCharCode("FPst"), hotKeyID.id == 1 else { return }
+
+        handleHotkeyTrigger()
     }
 
     private func handleKeyEvent(_ event: NSEvent) {
@@ -496,6 +569,22 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    private func handleHotkeyTrigger() {
+        let now = CFAbsoluteTimeGetCurrent()
+        lock.lock()
+        let shouldIgnore = (now - lastHotkeyHandledAt) < 0.15
+        if !shouldIgnore {
+            lastHotkeyHandledAt = now
+        }
+        lock.unlock()
+        guard !shouldIgnore else { return }
+
+        hotkeyQueue.async { [weak self] in
+            self?.waitForHotkeyReleaseThenSettle()
+            self?.triggerTypingFromClipboard()
+        }
+    }
+
     private func waitForHotkeyReleaseThenSettle() {
         let timeoutAt = CFAbsoluteTimeGetCurrent() + 2.0
         while areHotkeyModifiersPressed(), CFAbsoluteTimeGetCurrent() < timeoutAt {
@@ -510,6 +599,14 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func triggerTypingFromClipboard() {
+        if !SwiftPermisoPermissions.isAccessibilityTrusted() {
+            DispatchQueue.main.async { [weak self] in
+                self?.presentPermissionHelperIfNeeded(panels: [.accessibility])
+                self?.startPermissionWatch()
+            }
+            return
+        }
+
         lock.lock()
         if isTyping {
             shouldCancelTyping = true
@@ -571,7 +668,11 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
 
             switch action {
             case .character(let string):
-                sendUnicode(string, source: source)
+                if string == "\n" {
+                    sendReturn(source: source)
+                } else {
+                    sendUnicode(string, source: source)
+                }
             case .backspace:
                 sendBackspace(source: source)
             case .delay(let delay):
@@ -635,9 +736,54 @@ final class FakePasteAppDelegate: NSObject, NSApplicationDelegate {
         up.post(tap: .cghidEventTap)
     }
 
-    private func requestAccessibilityPermissionPrompt() {
-        let options: CFDictionary = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
+    private func sendReturn(source: CGEventSource) {
+        let keycode: CGKeyCode = 36
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: keycode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: keycode, keyDown: false)
+        else {
+            return
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
+    private func fourCharCode(_ value: String) -> OSType {
+        value.utf8.reduce(0) { ($0 << 8) + OSType($1) }
+    }
+
+    @MainActor
+    @objc private func openPermissionHelper() {
+        presentPermissionHelperIfNeeded(panels: [.accessibility, .inputMonitoring], force: true)
+    }
+
+    @MainActor
+    private func presentPermissionHelperIfNeeded(panels: [SwiftPermisoPanel], force: Bool = false) {
+        let hasAccessibility = SwiftPermisoPermissions.isAccessibilityTrusted(prompt: false)
+        guard force || !hasAccessibility else { return }
+
+        _ = SwiftPermisoPermissions.isAccessibilityTrusted(prompt: true)
+        SwiftPermisoAssistant.shared.presentMissingPanels(panels)
+    }
+
+    @MainActor
+    private func startPermissionWatch() {
+        permissionWatchTimer?.invalidate()
+        permissionWatchTimer = Timer.scheduledTimer(
+            timeInterval: 0.5,
+            target: self,
+            selector: #selector(permissionWatchDidFire(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+    }
+
+    @MainActor
+    @objc private func permissionWatchDidFire(_ timer: Timer) {
+        guard SwiftPermisoPermissions.isAccessibilityTrusted() else { return }
+
+        timer.invalidate()
+        permissionWatchTimer = nil
+        SwiftPermisoAssistant.shared.dismiss()
     }
 
     @objc private func quitApp() {

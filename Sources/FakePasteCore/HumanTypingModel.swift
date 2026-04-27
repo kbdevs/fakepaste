@@ -35,7 +35,10 @@ public struct HumanTypingModel {
     public func typingPlan<R: RandomNumberGenerator>(for text: String, rng: inout R) -> [TypingAction] {
         var actions: [TypingAction] = []
         let base = baseDelay()
-        let characters = Array(text).map(String.init)
+        let normalizedText = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let characters = Array(normalizedText).map(String.init)
 
         for index in characters.indices {
             let ch = characters[index]

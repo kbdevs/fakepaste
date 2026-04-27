@@ -77,8 +77,9 @@ cat > "$PLIST_PATH" <<EOF
 </plist>
 EOF
 
-launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
-launchctl load "$PLIST_PATH"
+launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
+launchctl enable "gui/$(id -u)/com.fakepaste.typer"
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 
 printf "Installed and started LaunchAgent: %s\n" "$PLIST_PATH"
 printf "Logs: %s/fakepaste.log and %s/fakepaste.err.log\n" "$LOG_DIR" "$LOG_DIR"

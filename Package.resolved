@@ -1,0 +1,15 @@
+{
+  "originHash" : "f6884d0c525c9b148d38d8152078eb7db9dfaa90a8745f091adafe55fa8e98ec",
+  "pins" : [
+    {
+      "identity" : "swiftpermiso",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/kbdevs/SwiftPermiso",
+      "state" : {
+        "branch" : "main",
+        "revision" : "f4261b324558ac7a52fcc98b6c2808ac0b58759c"
+      }
+    }
+  ],
+  "version" : 3
+}

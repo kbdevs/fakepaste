@@ -30,6 +30,30 @@ final class HumanTypingModelTests: XCTestCase {
         XCTAssertTrue(plan.contains(.character("c")))
     }
 
+    func testTypingPlanPreservesNewlines() {
+        let model = HumanTypingModel(targetWPM: 120, typoRate: 0, wordPauseChance: 0)
+        var rng = FixedRNG(seed: 42)
+        let plan = model.typingPlan(for: "one\n\ntwo", rng: &rng)
+        let characters = plan.compactMap { action -> String? in
+            if case let .character(character) = action {
+                return character
+            }
+            return nil
+        }
+
+        XCTAssertEqual(characters, ["o", "n", "e", "\n", "\n", "t", "w", "o"])
+    }
+
+    func testTypingPlanNormalizesCarriageReturnNewlines() {
+        let model = HumanTypingModel(targetWPM: 120, typoRate: 0, wordPauseChance: 0)
+        var rng = FixedRNG(seed: 42)
+        let plan = model.typingPlan(for: "one\r\ntwo\rthree", rng: &rng)
+        let newlines = plan.filter { $0 == .character("\n") }
+
+        XCTAssertEqual(newlines.count, 2)
+        XCTAssertFalse(plan.contains(.character("\r")))
+    }
+
     func testDelayAlwaysPositive() {
         let model = HumanTypingModel(targetWPM: 120)
         var rng = FixedRNG(seed: 7)

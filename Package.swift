@@ -8,11 +8,14 @@ let package = Package(
         .executable(name: "FakePasteApp", targets: ["FakePasteApp"]),
         .library(name: "FakePasteCore", targets: ["FakePasteCore"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/kbdevs/SwiftPermiso", branch: "main"),
+    ],
     targets: [
         .target(name: "FakePasteCore"),
         .executableTarget(
             name: "FakePasteApp",
-            dependencies: ["FakePasteCore"]
+            dependencies: ["FakePasteCore", "SwiftPermiso"]
         ),
         .testTarget(
             name: "FakePasteCoreTests",
